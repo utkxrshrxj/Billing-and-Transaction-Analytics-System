@@ -4,9 +4,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
+import plotly.graph_objects as go
 import os
 import datetime
 import calendar
+import io
+from itertools import combinations
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors as rl_colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
 # ----------------------------------------------------
 # INDIAN NUMBER FORMATTING HELPERS
@@ -30,6 +39,214 @@ def format_units(value):
         return f"{value:,}"
 
 # ----------------------------------------------------
+
+# ─────────────────────────────────────────────────────────────
+# ABC INVENTORY HELPER
+# ─────────────────────────────────────────────────────────────
+def compute_abc(sku_agg):
+    """Assigns A / B / C class to each SKU based on cumulative revenue contribution."""
+    if len(sku_agg) == 0:
+        return sku_agg
+    df = sku_agg.sort_values('Total_Revenue', ascending=False).copy()
+    df['Cum_Rev'] = df['Total_Revenue'].cumsum()
+    total = df['Total_Revenue'].sum()
+    df['Cum_Pct'] = df['Cum_Rev'] / total * 100
+    df['ABC_Class'] = df['Cum_Pct'].apply(
+        lambda x: 'A' if x <= 70 else ('B' if x <= 90 else 'C')
+    )
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
+# COHORT RETENTION HELPER
+# ─────────────────────────────────────────────────────────────
+def compute_cohort(df):
+    """Builds a monthly cohort retention matrix from transaction data."""
+    if len(df) == 0:
+        return pd.DataFrame()
+    tmp = df[['Customer_ID', 'Billing_Date']].copy()
+    tmp['OrderMonth'] = tmp['Billing_Date'].dt.to_period('M')
+    cohort_month = tmp.groupby('Customer_ID')['OrderMonth'].min().rename('CohortMonth')
+    tmp = tmp.join(cohort_month, on='Customer_ID')
+    tmp['CohortIndex'] = (tmp['OrderMonth'] - tmp['CohortMonth']).apply(lambda x: x.n)
+    cohort_data = tmp.groupby(['CohortMonth', 'CohortIndex'])['Customer_ID'].nunique().reset_index()
+    cohort_pivot = cohort_data.pivot_table(index='CohortMonth', columns='CohortIndex', values='Customer_ID')
+    cohort_sizes = cohort_pivot.iloc[:, 0]
+    retention = cohort_pivot.divide(cohort_sizes, axis=0) * 100
+    return retention
+
+
+# ─────────────────────────────────────────────────────────────
+# MARKET BASKET HELPER
+# ─────────────────────────────────────────────────────────────
+def compute_market_basket(df, top_n=30):
+    """Finds top SKU pairs by co-occurrence and computes confidence."""
+    if len(df) == 0:
+        return pd.DataFrame()
+    # Use agg(list) and cast SKU to str first to prevent NaN float entries
+    tmp = df[['Customer_ID', 'Billing_Date', 'SKU']].copy()
+    tmp['SKU'] = tmp['SKU'].astype(str)
+    baskets = tmp.groupby(['Customer_ID', 'Billing_Date'])['SKU'].agg(list).reset_index()
+    # Guard: only keep rows where SKU is actually a list with >1 items
+    baskets = baskets[baskets['SKU'].apply(lambda x: isinstance(x, list) and len(x) > 1)]
+    if len(baskets) == 0:
+        return pd.DataFrame()
+    pair_counts = {}
+    sku_counts = {}
+    for _, row in baskets.iterrows():
+        skus = list(set(row['SKU']))
+        for sku in skus:
+            sku_counts[sku] = sku_counts.get(sku, 0) + 1
+        for pair in combinations(sorted(skus), 2):
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
+    total_baskets = len(baskets)
+    rows = []
+    for (a, b), cnt in pair_counts.items():
+        conf_ab = cnt / sku_counts.get(a, 1) * 100
+        conf_ba = cnt / sku_counts.get(b, 1) * 100
+        support = cnt / total_baskets * 100
+        rows.append({'SKU_A': a, 'SKU_B': b, 'Co_Occurrences': cnt,
+                     'Support_%': round(support, 2),
+                     'Confidence_AtoB_%': round(conf_ab, 1),
+                     'Confidence_BtoA_%': round(conf_ba, 1)})
+    result = pd.DataFrame(rows).sort_values('Co_Occurrences', ascending=False).head(top_n)
+    return result.reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# PDF EXPORT HELPER
+# ─────────────────────────────────────────────────────────────
+def generate_pdf_report(kpi_rev, kpi_qty, kpi_cust, kpi_skus,
+                         top_skus_df, top_cust_df, rfm_summary_df,
+                         abc_summary_df, date_range):
+    """Generates an executive PDF report using reportlab."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            rightMargin=2*cm, leftMargin=2*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+    styles = getSampleStyleSheet()
+    story = []
+
+    title_style = ParagraphStyle('Title', parent=styles['Title'],
+                                  fontSize=20, textColor=rl_colors.HexColor('#00ADB5'),
+                                  spaceAfter=6, alignment=TA_CENTER)
+    story.append(Paragraph('Billing & Transaction Analytics', title_style))
+    story.append(Paragraph('Executive Summary Report', styles['Normal']))
+    story.append(Spacer(1, 0.3*cm))
+
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        dr_text = f"Period: {date_range[0].strftime('%d %b %Y')} \u2013 {date_range[1].strftime('%d %b %Y')}"
+    else:
+        dr_text = "Period: Full Dataset"
+    story.append(Paragraph(dr_text, styles['Normal']))
+    story.append(Spacer(1, 0.5*cm))
+    story.append(HRFlowable(width='100%', thickness=1, color=rl_colors.HexColor('#00ADB5')))
+    story.append(Spacer(1, 0.5*cm))
+
+    story.append(Paragraph('Key Performance Indicators', styles['Heading2']))
+    kpi_data = [
+        ['Metric', 'Value'],
+        ['Total Revenue', kpi_rev],
+        ['Total Quantity Sold', f'{kpi_qty:,}'],
+        ['Active Customers', f'{kpi_cust:,}'],
+        ['Active SKUs', f'{kpi_skus:,}'],
+    ]
+    kpi_table = Table(kpi_data, colWidths=[8*cm, 8*cm])
+    kpi_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#00ADB5')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), rl_colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [rl_colors.HexColor('#f5f5f5'), rl_colors.white]),
+        ('GRID', (0, 0), (-1, -1), 0.5, rl_colors.HexColor('#cccccc')),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('PADDING', (0, 0), (-1, -1), 6),
+    ]))
+    story.append(kpi_table)
+    story.append(Spacer(1, 0.6*cm))
+
+    story.append(Paragraph('Top 10 SKUs by Revenue', styles['Heading2']))
+    sku_data = [['SKU', 'Revenue (\u20b9)', 'Qty', 'Transactions']] + [
+        [r['SKU'], f"\u20b9{r['Total_Revenue']:,.0f}", f"{int(r['Total_Quantity']):,}", f"{int(r['Tx_Count']):,}"]
+        for _, r in top_skus_df.iterrows()
+    ]
+    sku_table = Table(sku_data, colWidths=[4*cm, 5*cm, 3*cm, 4*cm])
+    sku_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#222831')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), rl_colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [rl_colors.HexColor('#f5f5f5'), rl_colors.white]),
+        ('GRID', (0, 0), (-1, -1), 0.5, rl_colors.HexColor('#cccccc')),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('PADDING', (0, 0), (-1, -1), 5),
+    ]))
+    story.append(sku_table)
+    story.append(Spacer(1, 0.6*cm))
+
+    story.append(Paragraph('Top 10 Customers by Spending', styles['Heading2']))
+    cust_data = [['Customer ID', 'Revenue (\u20b9)', 'Qty', 'Transactions']] + [
+        [r['Customer_ID'], f"\u20b9{r['Total_Revenue']:,.0f}", f"{int(r['Total_Quantity']):,}", f"{int(r['Tx_Count']):,}"]
+        for _, r in top_cust_df.iterrows()
+    ]
+    cust_table = Table(cust_data, colWidths=[4*cm, 5*cm, 3*cm, 4*cm])
+    cust_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#222831')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), rl_colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [rl_colors.HexColor('#f5f5f5'), rl_colors.white]),
+        ('GRID', (0, 0), (-1, -1), 0.5, rl_colors.HexColor('#cccccc')),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('PADDING', (0, 0), (-1, -1), 5),
+    ]))
+    story.append(cust_table)
+    story.append(Spacer(1, 0.6*cm))
+
+    if rfm_summary_df is not None and len(rfm_summary_df) > 0:
+        story.append(Paragraph('RFM Customer Segment Summary', styles['Heading2']))
+        rfm_data = [['Segment', 'Customers', 'Avg Recency (days)', 'Avg Freq', 'Total Revenue']] + [
+            [r['Segment'], f"{int(r['Customers']):,}",
+             f"{r['Avg_Recency']:.1f}", f"{r['Avg_Freq']:.1f}",
+             f"\u20b9{r['Total_Revenue']:,.0f}"]
+            for _, r in rfm_summary_df.iterrows()
+        ]
+        rfm_table = Table(rfm_data, colWidths=[4*cm, 3*cm, 4*cm, 3*cm, 4*cm])
+        rfm_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#00ADB5')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), rl_colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [rl_colors.HexColor('#f5f5f5'), rl_colors.white]),
+            ('GRID', (0, 0), (-1, -1), 0.5, rl_colors.HexColor('#cccccc')),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('PADDING', (0, 0), (-1, -1), 5),
+        ]))
+        story.append(rfm_table)
+        story.append(Spacer(1, 0.6*cm))
+
+    if abc_summary_df is not None and len(abc_summary_df) > 0:
+        story.append(Paragraph('ABC Inventory Class Summary', styles['Heading2']))
+        abc_group = abc_summary_df.groupby('ABC_Class').agg(
+            SKU_Count=('SKU', 'count'),
+            Total_Revenue=('Total_Revenue', 'sum')
+        ).reset_index()
+        abc_data = [['Class', 'SKU Count', 'Total Revenue']] + [
+            [r['ABC_Class'], f"{int(r['SKU_Count']):,}", f"\u20b9{r['Total_Revenue']:,.0f}"]
+            for _, r in abc_group.iterrows()
+        ]
+        abc_table = Table(abc_data, colWidths=[4*cm, 5*cm, 7*cm])
+        abc_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#222831')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), rl_colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [rl_colors.HexColor('#f5f5f5'), rl_colors.white]),
+            ('GRID', (0, 0), (-1, -1), 0.5, rl_colors.HexColor('#cccccc')),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('PADDING', (0, 0), (-1, -1), 5),
+        ]))
+        story.append(abc_table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
 
 def compute_rfm(df_full, customer_agg):
     if len(customer_agg) == 0:
@@ -621,11 +838,14 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # Define Tabs
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Executive Summary", 
-    "📈 Temporal Seasonality", 
-    "📦 SKU Deep-Dive", 
-    "👥 Client Insights"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📊 Executive Summary",
+    "📈 Temporal Seasonality",
+    "📦 SKU Deep-Dive",
+    "👥 Client Insights",
+    "🏷️ ABC Inventory",
+    "🔁 Cohort Retention",
+    "🛒 Market Basket"
 ])
 
 # ----------------------------------------------------
@@ -853,3 +1073,261 @@ with tab4:
         st.info("No RFM data available.")
 
 
+# ----------------------------------------------------
+# TAB 5: ABC INVENTORY ANALYSIS
+# ----------------------------------------------------
+with tab5:
+    st.markdown(f"<h3 style='color: {text_primary}; margin-bottom: 5px;'>🏷️ ABC Inventory Analysis</h3>", unsafe_allow_html=True)
+    st.markdown(f"<p style='color: {text_muted}; font-size: 0.85rem; margin-bottom: 20px;'>Categorises SKUs into Class A (top 70% revenue), Class B (next 20%), and Class C (bottom 10%) using cumulative Pareto logic.</p>", unsafe_allow_html=True)
+
+    abc_df = compute_abc(sku_agg)
+
+    if len(abc_df) > 0:
+        # ── Pareto Chart ──
+        top_abc = abc_df.head(60)  # limit for readability
+        fig_pareto = go.Figure()
+        # Bar: individual SKU revenue
+        fig_pareto.add_trace(go.Bar(
+            x=top_abc['SKU'].astype(str),
+            y=top_abc['Total_Revenue'],
+            name='Revenue',
+            marker_color=top_abc['ABC_Class'].map({'A': '#00ADB5', 'B': '#F6C90E', 'C': '#F87171'}),
+            hovertemplate='<b>%{x}</b><br>Revenue: ₹%{y:,.0f}<extra></extra>'
+        ))
+        # Line: cumulative %
+        fig_pareto.add_trace(go.Scatter(
+            x=top_abc['SKU'].astype(str),
+            y=top_abc['Cum_Pct'],
+            name='Cumulative %',
+            yaxis='y2',
+            line=dict(color='#EEEEEE', width=2, dash='dot'),
+            hovertemplate='%{y:.1f}%<extra></extra>'
+        ))
+        fig_pareto.add_hline(y=70, line_dash='dash', line_color='#00ADB5',
+                             annotation_text='70% — Class A cutoff', yref='y2',
+                             annotation_font_color='#00ADB5')
+        fig_pareto.add_hline(y=90, line_dash='dash', line_color='#F6C90E',
+                             annotation_text='90% — Class B cutoff', yref='y2',
+                             annotation_font_color='#F6C90E')
+        fig_pareto.update_layout(
+            title='Pareto Chart — SKU Revenue with Cumulative % (top 60 SKUs)',
+            yaxis=dict(title='Revenue (₹)', color=text_primary),
+            yaxis2=dict(title='Cumulative Revenue %', overlaying='y', side='right',
+                        range=[0, 105], color=text_primary),
+            xaxis=dict(showticklabels=False, title='SKUs (sorted by revenue)'),
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(57,62,70,0.15)',
+            font_color=text_primary, legend=dict(orientation='h', y=1.08)
+        )
+        st.plotly_chart(fig_pareto, use_container_width=True)
+
+        # ── ABC Class Summary ──
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.markdown(f"<h4 style='color: {text_primary};'>📊 Class Summary</h4>", unsafe_allow_html=True)
+            abc_summary = abc_df.groupby('ABC_Class').agg(
+                SKU_Count=('SKU', 'count'),
+                Total_Revenue=('Total_Revenue', 'sum'),
+                Total_Qty=('Total_Quantity', 'sum')
+            ).reindex(['A', 'B', 'C']).reset_index()
+            abc_summary['Revenue_Share_%'] = (abc_summary['Total_Revenue'] / abc_summary['Total_Revenue'].sum() * 100).round(1)
+            abc_summary['SKU_Share_%'] = (abc_summary['SKU_Count'] / abc_summary['SKU_Count'].sum() * 100).round(1)
+            st.dataframe(abc_summary.style.format({
+                'Total_Revenue': lambda x: format_inr(x),
+                'Total_Qty': '{:,}',
+                'Revenue_Share_%': '{:.1f}%',
+                'SKU_Share_%': '{:.1f}%'
+            }), use_container_width=True, hide_index=True)
+        with col2:
+            st.markdown(f"<h4 style='color: {text_primary};'>🏷️ Class Distribution</h4>", unsafe_allow_html=True)
+            fig_abc_pie = px.pie(abc_summary, values='SKU_Count', names='ABC_Class',
+                                 color='ABC_Class',
+                                 color_discrete_map={'A': '#00ADB5', 'B': '#F6C90E', 'C': '#F87171'},
+                                 hole=0.45, title='SKUs by ABC Class')
+            fig_abc_pie.update_layout(paper_bgcolor='rgba(0,0,0,0)', font_color=text_primary)
+            st.plotly_chart(fig_abc_pie, use_container_width=True)
+
+        # ── SKU table filterable by class ──
+        st.markdown(f"<h4 style='color: {text_primary}; margin-top: 10px;'>🗂️ Full SKU Classification Table</h4>", unsafe_allow_html=True)
+        selected_class = st.selectbox("Filter by class", ['All', 'A', 'B', 'C'], key='abc_class_filter')
+        view_df = abc_df if selected_class == 'All' else abc_df[abc_df['ABC_Class'] == selected_class]
+        st.dataframe(
+            view_df[['SKU', 'Total_Revenue', 'Total_Quantity', 'Tx_Count', 'Cum_Pct', 'ABC_Class']]
+            .rename(columns={'Total_Revenue': 'Revenue (₹)', 'Total_Quantity': 'Qty',
+                             'Tx_Count': 'Transactions', 'Cum_Pct': 'Cumulative %', 'ABC_Class': 'Class'})
+            .style.format({'Revenue (₹)': lambda x: format_inr(x), 'Qty': '{:,}',
+                           'Transactions': '{:,}', 'Cumulative %': '{:.1f}%'}),
+            use_container_width=True, hide_index=True
+        )
+    else:
+        st.info("No SKU data available for ABC analysis.")
+
+
+# ----------------------------------------------------
+# TAB 6: COHORT RETENTION ANALYSIS
+# ----------------------------------------------------
+with tab6:
+    st.markdown(f"<h3 style='color: {text_primary}; margin-bottom: 5px;'>🔁 Cohort Retention Analysis</h3>", unsafe_allow_html=True)
+    st.markdown(f"<p style='color: {text_muted}; font-size: 0.85rem; margin-bottom: 20px;'>Groups customers by their first purchase month and tracks what % returned in each subsequent month. Reveals loyalty and churn patterns.</p>", unsafe_allow_html=True)
+
+    with st.spinner('Computing cohort matrix...'):
+        retention = compute_cohort(df_filtered)
+
+    if retention is not None and len(retention) > 0:
+        # Format index for display
+        retention.index = retention.index.astype(str)
+        retention.columns = [f'M+{c}' for c in retention.columns]
+
+        fig_cohort, ax_cohort = plt.subplots(figsize=(14, max(5, len(retention) * 0.55)))
+        fig_cohort.patch.set_facecolor(plot_bg)
+        ax_cohort.set_facecolor(plot_bg)
+
+        sns.heatmap(
+            retention,
+            annot=True, fmt='.0f',
+            cmap='YlGnBu',
+            linewidths=0.4,
+            linecolor=(1.0, 1.0, 1.0, 0.05),
+            cbar_kws={'label': 'Retention %'},
+            ax=ax_cohort,
+            vmin=0, vmax=100
+        )
+        ax_cohort.set_title('Customer Retention by Cohort Month (%)', color=text_primary,
+                            fontsize=13, fontweight='bold', pad=15)
+        ax_cohort.set_xlabel('Months Since First Purchase', color=text_primary, fontsize=10)
+        ax_cohort.set_ylabel('Cohort (First Purchase Month)', color=text_primary, fontsize=10)
+        ax_cohort.tick_params(colors=text_muted, labelsize=8)
+        ax_cohort.figure.axes[-1].yaxis.label.set_color(text_primary)
+        ax_cohort.figure.axes[-1].tick_params(colors=text_muted)
+        plt.tight_layout()
+        st.pyplot(fig_cohort)
+        plt.close(fig_cohort)
+
+        # Key insights
+        st.markdown(f"<br>", unsafe_allow_html=True)
+        col1, col2, col3 = st.columns(3)
+        m1_col = 'M+1' if 'M+1' in retention.columns else None
+        m3_col = 'M+3' if 'M+3' in retention.columns else None
+        m6_col = 'M+6' if 'M+6' in retention.columns else None
+
+        with col1:
+            if m1_col:
+                val = retention[m1_col].mean()
+                st.markdown(f"""
+                <div style='background:{card_bg}; border:1px solid {border_color}; border-radius:12px; padding:18px; text-align:center;'>
+                    <div style='color:{text_muted}; font-size:0.8rem; font-weight:600; text-transform:uppercase;'>Avg M+1 Retention</div>
+                    <div style='color:{text_primary}; font-size:1.8rem; font-weight:700;'>{val:.1f}%</div>
+                </div>""", unsafe_allow_html=True)
+        with col2:
+            if m3_col:
+                val = retention[m3_col].mean()
+                st.markdown(f"""
+                <div style='background:{card_bg}; border:1px solid {border_color}; border-radius:12px; padding:18px; text-align:center;'>
+                    <div style='color:{text_muted}; font-size:0.8rem; font-weight:600; text-transform:uppercase;'>Avg M+3 Retention</div>
+                    <div style='color:{text_primary}; font-size:1.8rem; font-weight:700;'>{val:.1f}%</div>
+                </div>""", unsafe_allow_html=True)
+        with col3:
+            if m6_col:
+                val = retention[m6_col].mean()
+                st.markdown(f"""
+                <div style='background:{card_bg}; border:1px solid {border_color}; border-radius:12px; padding:18px; text-align:center;'>
+                    <div style='color:{text_muted}; font-size:0.8rem; font-weight:600; text-transform:uppercase;'>Avg M+6 Retention</div>
+                    <div style='color:{text_primary}; font-size:1.8rem; font-weight:700;'>{val:.1f}%</div>
+                </div>""", unsafe_allow_html=True)
+    else:
+        st.info("Insufficient data to compute cohort retention.")
+
+
+# ----------------------------------------------------
+# TAB 7: MARKET BASKET ANALYSIS
+# ----------------------------------------------------
+with tab7:
+    st.markdown(f"<h3 style='color: {text_primary}; margin-bottom: 5px;'>🛒 Market Basket Analysis</h3>", unsafe_allow_html=True)
+    st.markdown(f"<p style='color: {text_muted}; font-size: 0.85rem; margin-bottom: 20px;'>Identifies SKU pairs that are frequently bought together. Confidence A→B means: <i>'X% of customers who bought A also bought B on the same day.'</i></p>", unsafe_allow_html=True)
+
+    top_n_pairs = st.slider("Number of SKU pairs to display", min_value=10, max_value=100, value=30, step=5, key='mba_topn')
+
+    with st.spinner('Analysing basket co-occurrences...'):
+        mba_df = compute_market_basket(df_filtered, top_n=top_n_pairs)
+
+    if mba_df is not None and len(mba_df) > 0:
+        col1, col2 = st.columns([1.6, 1])
+
+        with col1:
+            st.markdown(f"<h4 style='color: {text_primary};'>📋 Top SKU Pairs by Co-Occurrence</h4>", unsafe_allow_html=True)
+            # Display styled pair rules
+            for _, row in mba_df.head(20).iterrows():
+                conf = max(row['Confidence_AtoB_%'], row['Confidence_BtoA_%'])
+                color = '#4ade80' if conf >= 60 else ('#F6C90E' if conf >= 30 else '#F87171')
+                st.markdown(f"""
+                <div style='background:{card_bg}; border:1px solid {border_color}; border-radius:10px;
+                            padding:12px 18px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;'>
+                    <div>
+                        <span style='color:{text_primary}; font-weight:700; font-size:0.95rem;'>{row['SKU_A']}</span>
+                        <span style='color:{text_muted};'> + </span>
+                        <span style='color:{text_primary}; font-weight:700; font-size:0.95rem;'>{row['SKU_B']}</span>
+                    </div>
+                    <div style='text-align:right;'>
+                        <span style='color:{color}; font-weight:700; font-size:1rem;'>{conf:.0f}% confidence</span>
+                        <br><span style='color:{text_muted}; font-size:0.75rem;'>{int(row['Co_Occurrences'])} co-occurrences · {row['Support_%']:.2f}% support</span>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+        with col2:
+            st.markdown(f"<h4 style='color: {text_primary};'>📊 Full Pairs Table</h4>", unsafe_allow_html=True)
+            st.dataframe(
+                mba_df.rename(columns={
+                    'SKU_A': 'SKU A', 'SKU_B': 'SKU B',
+                    'Co_Occurrences': 'Co-Occur',
+                    'Support_%': 'Support%',
+                    'Confidence_AtoB_%': 'Conf A→B%',
+                    'Confidence_BtoA_%': 'Conf B→A%'
+                }),
+                use_container_width=True, hide_index=True
+            )
+    else:
+        st.info("Not enough multi-item baskets found. Try removing SKU or Customer filters.")
+
+
+# ----------------------------------------------------
+# PDF EXPORT — Sidebar Download Button
+# ----------------------------------------------------
+st.sidebar.markdown("<hr style='border-color: rgba(57,62,70,0.5); margin: 1.5rem 0;'>", unsafe_allow_html=True)
+st.sidebar.markdown(f"<h4 style='color: {text_secondary}; font-size: 0.95rem; font-weight: 600; margin-bottom: 5px;'>📄 Executive Report</h4>", unsafe_allow_html=True)
+
+if st.sidebar.button("📥 Download PDF Report", use_container_width=True, type='primary'):
+    with st.spinner('Generating executive PDF report...'):
+        top_skus_export = sku_agg.sort_values('Total_Revenue', ascending=False).head(10)
+        top_cust_export = customer_agg.sort_values('Total_Revenue', ascending=False).head(10)
+
+        rfm_export = None
+        if 'Segment' in customer_agg.columns:
+            rfm_export = customer_agg.groupby('Segment').agg(
+                Customers=('Customer_ID', 'count'),
+                Avg_Recency=('Recency', 'mean'),
+                Avg_Freq=('Tx_Count', 'mean'),
+                Total_Revenue=('Total_Revenue', 'sum')
+            ).reset_index()
+
+        abc_export = compute_abc(sku_agg)
+
+        dr = (pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])) if isinstance(date_range, tuple) else None
+
+        pdf_buffer = generate_pdf_report(
+            kpi_rev=format_inr(kpi_revenue),
+            kpi_qty=kpi_quantity,
+            kpi_cust=kpi_customers,
+            kpi_skus=kpi_skus,
+            top_skus_df=top_skus_export,
+            top_cust_df=top_cust_export,
+            rfm_summary_df=rfm_export,
+            abc_summary_df=abc_export,
+            date_range=dr
+        )
+
+    st.sidebar.download_button(
+        label="⬇️ Click to Download",
+        data=pdf_buffer,
+        file_name=f"BTAS_Report_{datetime.date.today().strftime('%Y%m%d')}.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
